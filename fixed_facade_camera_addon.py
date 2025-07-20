@@ -3,10 +3,10 @@
 bl_info = {
     "name": "Быстрые фасады",
     "author": "Максим Ефанов",
-    "version": (6, 5, 0),  # Добавлена: специальные настройки рендера (display_device, view_transform, show_object_outline), обновлены пресеты разрешений, добавлена система сохранения пользовательских пресетов в аддон-преференсах
+    "version": (6, 6, 0),  # Добавлен: автоматический расчёт clipping planes на основе габаритов объекта
     "blender": (4, 5, 0),
     "location": "3D View > N-панель > Быстрые фасады",
-    "description": "Создаёт камеры по полигонам для рендера фасадов с автоматическим расчётом расстояния и созданием папок, рендером выделенных камер, рендером камер объекта и управлением по объектам. Добавлены специальные рендер-настройки и пользовательские пресеты.",
+    "description": "Создаёт камеры по полигонам для рендера фасадов с автоматическим расчётом расстояния, clipping planes и созданием папок, рендером выделенных камер, рендером камер объекта и управлением по объектам. Добавлены специальные рендер-настройки и пользовательские пресеты.",
     "warning": "Перед рендером сохраните файл .blend.",
     "doc_url": "",
     "category": "Объект",
@@ -28,6 +28,63 @@ def get_auto_output_path(obj_name):
     clean_name = bpy.path.clean_name(obj_name)
     return f"//renders/{clean_name}/"
 
+# Функция для расчёта оптимальных clipping planes
+def calculate_clipping_planes(obj, camera_location, camera_direction):
+    """Рассчитать оптимальные clipping planes на основе габаритов объекта и позиции камеры"""
+    try:
+        # Получаем мировые координаты всех вершин объекта
+        world_matrix = obj.matrix_world
+        mesh = obj.data
+        
+        # Создаём временный bmesh для получения вершин
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        
+        # Получаем все вершины в мировых координатах
+        world_vertices = [world_matrix @ v.co for v in bm.verts]
+        bm.free()
+        
+        if not world_vertices:
+            return 0.1, 1000.0
+        
+        # Проецируем все вершины на направление камеры
+        camera_dir_normalized = camera_direction.normalized()
+        
+        # Вычисляем расстояния от камеры до всех вершин вдоль направления камеры
+        distances = []
+        for vertex in world_vertices:
+            # Вектор от камеры к вершине
+            to_vertex = vertex - camera_location
+            # Проекция на направление камеры (отрицательное значение = позади камеры)
+            distance = to_vertex.dot(camera_dir_normalized)
+            distances.append(distance)
+        
+        if not distances:
+            return 0.1, 1000.0
+        
+        min_distance = min(distances)
+        max_distance = max(distances)
+        
+        # Добавляем буферы для безопасности
+        # Clip start: минимальное расстояние минус буфер (но не меньше 0.001)
+        clip_start = max(0.001, min_distance - abs(min_distance) * 0.1 - 1.0)
+        
+        # Clip end: максимальное расстояние плюс буфер
+        clip_end = max_distance + abs(max_distance) * 0.1 + 10.0
+        
+        # Проверяем разумные пределы
+        if clip_end - clip_start < 1.0:
+            clip_end = clip_start + 1000.0
+        
+        # Убеждаемся, что clip_end достаточно большой
+        clip_end = max(clip_end, 100.0)
+        
+        return clip_start, clip_end
+        
+    except Exception as e:
+        print(f"Ошибка при расчёте clipping planes: {e}")
+        return 0.1, 1000.0
+
 # ------------------------------------------------------------------------
 # ГРУППА СВОЙСТВ ДЛЯ НАСТРОЕК
 # ------------------------------------------------------------------------
@@ -40,6 +97,11 @@ class SDE_CameraProSettings(bpy.types.PropertyGroup):
     auto_distance: bpy.props.BoolProperty(
         name="Автоматическое расстояние",
         description="Автоматически рассчитывать расстояние от крайней точки фасада с определением направления нормали",
+        default=True
+    )
+    auto_clipping: bpy.props.BoolProperty(
+        name="Автоматические clipping planes",
+        description="Автоматически рассчитывать clipping planes на основе габаритов объекта",
         default=True
     )
     max_resolution: bpy.props.IntProperty(
@@ -72,16 +134,19 @@ class SDE_CameraProSettings(bpy.types.PropertyGroup):
         if self.preset == 'HIGH_RES':
             self.max_resolution = 10000
             self.auto_distance = True
+            self.auto_clipping = True
             self.ignore_percentage = True
             self.output_path = ""  # Использовать автоматический путь
         elif self.preset == 'QUICK_PREVIEW':
             self.max_resolution = 4000
             self.auto_distance = False
+            self.auto_clipping = True
             self.ignore_percentage = False
             self.output_path = ""  # Использовать автоматический путь
         elif self.preset == 'DEFAULT':
             self.max_resolution = 2000
             self.auto_distance = True
+            self.auto_clipping = True
             self.ignore_percentage = True
             self.output_path = ""
 
@@ -92,6 +157,7 @@ class SDE_Preset(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Имя пресета", default="Новый пресет")
     distance: bpy.props.FloatProperty(default=50.0)
     auto_distance: bpy.props.BoolProperty(default=True)
+    auto_clipping: bpy.props.BoolProperty(default=True)
     max_resolution: bpy.props.IntProperty(default=2000)
     ignore_percentage: bpy.props.BoolProperty(default=True)
     output_path: bpy.props.StringProperty(default="")
@@ -121,6 +187,7 @@ class SDE_OT_add_preset(bpy.types.Operator):
         new_preset.name = f"Пресет {len(prefs.presets)}"
         new_preset.distance = settings.distance
         new_preset.auto_distance = settings.auto_distance
+        new_preset.auto_clipping = settings.auto_clipping
         new_preset.max_resolution = settings.max_resolution
         new_preset.ignore_percentage = settings.ignore_percentage
         new_preset.output_path = settings.output_path
@@ -172,6 +239,7 @@ class SDE_OT_load_preset(bpy.types.Operator):
             preset = prefs.presets[prefs.selected_preset_index]
             settings.distance = preset.distance
             settings.auto_distance = preset.auto_distance
+            settings.auto_clipping = preset.auto_clipping
             settings.max_resolution = preset.max_resolution
             settings.ignore_percentage = preset.ignore_percentage
             settings.output_path = preset.output_path
@@ -198,6 +266,7 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
     distance: bpy.props.FloatProperty()
     max_resolution: bpy.props.IntProperty()
     auto_distance: bpy.props.BoolProperty()
+    auto_clipping: bpy.props.BoolProperty()
 
     @classmethod
     def poll(cls, context):
@@ -237,18 +306,18 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             if not verts_to_project: 
                 continue
 
-            cam_data_tuple = self.get_framing_data(face, world_matrix, verts_to_project, all_verts)
+            cam_data_tuple = self.get_framing_data(face, world_matrix, verts_to_project, all_verts, obj)
             if not cam_data_tuple: 
                 continue
             
-            final_cam_location, cam_rotation_quat, ortho_scale, res_x, res_y = cam_data_tuple
+            final_cam_location, cam_rotation_quat, ortho_scale, res_x, res_y, clip_start, clip_end = cam_data_tuple
             
             cam_name = f"{short_name}_face_{face.index:03d}"
             camera_data = bpy.data.cameras.new(name=cam_name)
             camera_data.type = 'ORTHO'
             camera_data.ortho_scale = ortho_scale
-            camera_data.clip_start = 0.001
-            camera_data.clip_end = max(100000.0, ortho_scale * 1000.0)
+            camera_data.clip_start = clip_start
+            camera_data.clip_end = clip_end
             
             camera_obj = bpy.data.objects.new(name=cam_name, object_data=camera_data)
             camera_obj.location = final_cam_location
@@ -264,7 +333,7 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
         self.report({'INFO'}, f"Создано камер: {len(created_cameras)} в коллекции «{cam_collection.name}»")
         return {'FINISHED'}
 
-    def get_framing_data(self, face, world_matrix, vertices, all_verts):
+    def get_framing_data(self, face, world_matrix, vertices, all_verts, obj):
         try:
             face_normal_world = (world_matrix.to_3x3() @ face.normal).normalized()
             face_center = world_matrix @ face.calc_center_median()
@@ -332,7 +401,16 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             
             final_scale = max(width, height) * padding
             
-            return (final_location, rotation, final_scale, res_x, res_y)
+            # Рассчитываем clipping planes
+            if self.auto_clipping:
+                camera_direction = -face_normal_world  # Направление взгляда камеры
+                clip_start, clip_end = calculate_clipping_planes(obj, final_location, camera_direction)
+            else:
+                # Значения по умолчанию
+                clip_start = 0.001
+                clip_end = max(100000.0, final_scale * 1000.0)
+            
+            return (final_location, rotation, final_scale, res_x, res_y, clip_start, clip_end)
         except Exception as e:
             print(f"Ошибка при обработке полигона: {e}")
             return None
@@ -877,6 +955,7 @@ class SDE_OT_auto_detect_settings(bpy.types.Operator):
             settings.distance = suggested_distance
             settings.max_resolution = suggested_max_res
             settings.auto_distance = True
+            settings.auto_clipping = True
 
             self.report({'INFO'}, f"Настройки определены: расстояние = {suggested_distance:.1f} м, максимальное разрешение = {suggested_max_res}")
             return {'FINISHED'}
@@ -913,6 +992,7 @@ class SDE_OT_help_popup(bpy.types.Operator):
             col.label(text="• Используйте «Определить настройки» для автонастройки")
             col.label(text="• Можно рендерить только выделенные камеры или камеры объекта")
             col.label(text="• Используйте пользовательские пресеты для сохранения настроек")
+            col.label(text="• Автоматические clipping planes предотвращают артефакты")
 
         context.window_manager.popup_menu(draw_popup, title="Инструкция", icon='QUESTION')
         return {'FINISHED'}
@@ -974,6 +1054,7 @@ class SDE_PT_cameras_pro_panel(bpy.types.Panel):
         row.active = not settings.auto_distance
         row.prop(settings, "distance", slider=True)
         creation_col.prop(settings, "auto_distance")
+        creation_col.prop(settings, "auto_clipping")
         creation_col.prop(settings, "max_resolution")
         
         op_create = creation_col.operator(SDE_OT_create_cameras_from_faces.bl_idname, text="Создать камеры", icon='ADD')
@@ -981,6 +1062,7 @@ class SDE_PT_cameras_pro_panel(bpy.types.Panel):
         op_create.distance = settings.distance
         op_create.max_resolution = settings.max_resolution
         op_create.auto_distance = settings.auto_distance
+        op_create.auto_clipping = settings.auto_clipping
 
         if not SDE_OT_create_cameras_from_faces.poll(context):
             creation_box.label(text="Доступно в режиме редактирования", icon='INFO')
@@ -1017,6 +1099,7 @@ class SDE_PT_cameras_pro_panel(bpy.types.Panel):
             res_y = scene.camera[CAM_RES_Y_PROP]
             manage_col.label(text=f"Активная камера: {scene.camera.name}", icon='CAMERA_DATA')
             manage_col.label(text=f"Разрешение: {res_x} × {res_y}", icon='IMAGE_PLANE')
+            manage_col.label(text=f"Clipping: {scene.camera.data.clip_start:.3f} - {scene.camera.data.clip_end:.1f}", icon='OUTLINER_DATA_CAMERA')
             manage_col.operator(SDE_OT_apply_camera_resolution.bl_idname, icon='CHECKMARK')
             manage_col.operator(SDE_OT_preview_camera.bl_idname, text="Просмотр камеры", icon='VIEW_CAMERA')
 
